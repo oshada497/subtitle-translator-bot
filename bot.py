@@ -2,6 +2,7 @@ import os
 import logging
 import re
 import sqlite3
+import asyncio
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 import google.generativeai as genai
@@ -53,11 +54,10 @@ def create_srt(subtitles):
         srt_content += f"{index}\n{timestamp}\n{text}\n\n"
     return srt_content
 
-# Translate text using Gemini
-async def translate_with_gemini(text, api_key):
+# Translate text using Gemini with retry logic and rate limiting
+async def translate_with_gemini(text, api_key, max_retries=3):
     try:
         genai.configure(api_key=api_key)
-        # Use gemini-2.5-flash-lite - lightweight and efficient
         model = genai.GenerativeModel('gemini-2.5-flash-lite')
         
         prompt = f"""Translate the following English subtitle text to Sinhala. 
@@ -66,8 +66,38 @@ async def translate_with_gemini(text, api_key):
         
         Text: {text}"""
         
-        response = model.generate_content(prompt)
-        return response.text.strip()
+        for attempt in range(max_retries):
+            try:
+                response = model.generate_content(prompt)
+                return response.text.strip()
+            except Exception as e:
+                error_str = str(e)
+                # Check if it's a rate limit error
+                if "429" in error_str or "quota" in error_str.lower():
+                    if attempt < max_retries - 1:
+                        # Extract retry delay from error message or use default
+                        wait_time = 35  # Default wait time
+                        if "retry in" in error_str.lower():
+                            try:
+                                # Try to extract the wait time from error message
+                                import re
+                                match = re.search(r'retry in (\d+)', error_str)
+                                if match:
+                                    wait_time = int(match.group(1)) + 2
+                            except:
+                                pass
+                        
+                        logger.warning(f"Rate limit hit. Waiting {wait_time} seconds... (Attempt {attempt + 1}/{max_retries})")
+                        await asyncio.sleep(wait_time)
+                        continue
+                    else:
+                        logger.error(f"Translation failed after {max_retries} attempts: {e}")
+                        return None
+                else:
+                    logger.error(f"Translation error: {e}")
+                    return None
+        
+        return None
     except Exception as e:
         logger.error(f"Translation error: {e}")
         return None
@@ -182,16 +212,26 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         await update.message.reply_text(
             f"📝 Found {len(subtitles)} subtitles.\n"
-            f"🔄 Starting translation... This may take a few minutes."
+            f"🔄 Starting translation...\n\n"
+            f"⚠️ Note: Free tier allows 15 requests/minute.\n"
+            f"This will take approximately {len(subtitles) // 12 + 1} minutes."
         )
         
-        # Translate subtitles
+        # Translate subtitles with rate limiting
         translated_subtitles = []
         total = len(subtitles)
         last_percent = 0
+        requests_count = 0
         
         for i, (index, timestamp, text) in enumerate(subtitles):
-            # Show progress every 25% instead of every 10 subtitles
+            # Rate limiting: Sleep after every 12 requests (safe under 15/min limit)
+            if requests_count >= 12:
+                logger.info("Rate limit protection: Waiting 60 seconds...")
+                await update.message.reply_text("⏸️ Pausing for 60 seconds to respect API limits...")
+                await asyncio.sleep(60)
+                requests_count = 0
+            
+            # Show progress every 25%
             current_percent = int((i + 1) / total * 100)
             if current_percent >= last_percent + 25 and current_percent < 100:
                 await update.message.reply_text(f"⏳ Progress: {current_percent}% ({i + 1}/{total})")
@@ -202,6 +242,11 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 translated_subtitles.append((index, timestamp, translated_text))
             else:
                 translated_subtitles.append((index, timestamp, text))  # Keep original if translation fails
+            
+            requests_count += 1
+            
+            # Small delay between requests
+            await asyncio.sleep(0.5)
         
         # Create translated SRT file
         translated_content = create_srt(translated_subtitles)
@@ -274,9 +319,9 @@ def main():
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     
-    # Start bot
+    # Start bot with drop_pending_updates to avoid conflicts
     logger.info("Bot started!")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 if __name__ == '__main__':
     main()
