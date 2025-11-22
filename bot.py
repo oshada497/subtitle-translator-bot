@@ -1,8 +1,9 @@
 import os
 import logging
 import re
-import sqlite3
 import asyncio
+import psycopg2
+from psycopg2 import pool
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 import google.generativeai as genai
@@ -16,30 +17,114 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Database setup
+# Database connection pool
+db_pool = None
+
 def init_db():
-    conn = sqlite3.connect('users.db')
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS users
-                 (user_id INTEGER PRIMARY KEY, api_key TEXT)''')
-    conn.commit()
-    conn.close()
+    global db_pool
+    try:
+        # Get DATABASE_URL from environment (Render provides this automatically)
+        database_url = os.environ.get('DATABASE_URL')
+        
+        if not database_url:
+            logger.error("DATABASE_URL not found! Using SQLite fallback...")
+            # Fallback to SQLite if PostgreSQL not available
+            import sqlite3
+            conn = sqlite3.connect('users.db')
+            c = conn.cursor()
+            c.execute('''CREATE TABLE IF NOT EXISTS users
+                         (user_id BIGINT PRIMARY KEY, api_key TEXT)''')
+            conn.commit()
+            conn.close()
+            return
+        
+        # Fix postgres:// to postgresql:// (Render uses old format)
+        if database_url.startswith('postgres://'):
+            database_url = database_url.replace('postgres://', 'postgresql://', 1)
+        
+        # Create connection pool
+        db_pool = psycopg2.pool.SimpleConnectionPool(
+            1, 10,  # min and max connections
+            database_url
+        )
+        
+        # Create table if not exists
+        conn = db_pool.getconn()
+        cursor = conn.cursor()
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                user_id BIGINT PRIMARY KEY,
+                api_key TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        conn.commit()
+        cursor.close()
+        db_pool.putconn(conn)
+        
+        logger.info("✅ PostgreSQL database initialized successfully!")
+        
+    except Exception as e:
+        logger.error(f"Database initialization error: {e}")
+        # Fallback to SQLite
+        import sqlite3
+        conn = sqlite3.connect('users.db')
+        c = conn.cursor()
+        c.execute('''CREATE TABLE IF NOT EXISTS users
+                     (user_id BIGINT PRIMARY KEY, api_key TEXT)''')
+        conn.commit()
+        conn.close()
 
 def save_api_key(user_id, api_key):
-    conn = sqlite3.connect('users.db')
-    c = conn.cursor()
-    c.execute('INSERT OR REPLACE INTO users (user_id, api_key) VALUES (?, ?)',
-              (user_id, api_key))
-    conn.commit()
-    conn.close()
+    global db_pool
+    try:
+        if db_pool:
+            # PostgreSQL
+            conn = db_pool.getconn()
+            cursor = conn.cursor()
+            cursor.execute(
+                'INSERT INTO users (user_id, api_key) VALUES (%s, %s) ON CONFLICT (user_id) DO UPDATE SET api_key = %s',
+                (user_id, api_key, api_key)
+            )
+            conn.commit()
+            cursor.close()
+            db_pool.putconn(conn)
+        else:
+            # SQLite fallback
+            import sqlite3
+            conn = sqlite3.connect('users.db')
+            c = conn.cursor()
+            c.execute('INSERT OR REPLACE INTO users (user_id, api_key) VALUES (?, ?)',
+                      (user_id, api_key))
+            conn.commit()
+            conn.close()
+    except Exception as e:
+        logger.error(f"Error saving API key: {e}")
 
 def get_api_key(user_id):
-    conn = sqlite3.connect('users.db')
-    c = conn.cursor()
-    c.execute('SELECT api_key FROM users WHERE user_id = ?', (user_id,))
-    result = c.fetchone()
-    conn.close()
-    return result[0] if result else None
+    global db_pool
+    try:
+        if db_pool:
+            # PostgreSQL
+            conn = db_pool.getconn()
+            cursor = conn.cursor()
+            cursor.execute('SELECT api_key FROM users WHERE user_id = %s', (user_id,))
+            result = cursor.fetchone()
+            cursor.close()
+            db_pool.putconn(conn)
+            return result[0] if result else None
+        else:
+            # SQLite fallback
+            import sqlite3
+            conn = sqlite3.connect('users.db')
+            c = conn.cursor()
+            c.execute('SELECT api_key FROM users WHERE user_id = ?', (user_id,))
+            result = c.fetchone()
+            conn.close()
+            return result[0] if result else None
+    except Exception as e:
+        logger.error(f"Error getting API key: {e}")
+        return None
 
 # Parse SRT file
 def parse_srt(content):
@@ -104,6 +189,7 @@ async def translate_with_gemini(text, api_key, max_retries=3):
 async def translate_batch_with_gemini(subtitle_batch, api_key, max_retries=3):
     try:
         genai.configure(api_key=api_key)
+        # Use gemini-2.5-flash-lite - 250K tokens/min allows HUGE batches!
         model = genai.GenerativeModel('gemini-2.5-flash-lite')
         
         # Create batch prompt with numbered subtitles
@@ -112,7 +198,7 @@ async def translate_batch_with_gemini(subtitle_batch, api_key, max_retries=3):
             batch_text += f"[{i}] {text.strip()}\n"
         
         prompt = f"""Translate these English subtitles to Sinhala. Keep translations natural and conversational.
-        
+
 Return ONLY the translations in the same format, one per line:
 [1] (Sinhala translation)
 [2] (Sinhala translation)
@@ -272,17 +358,18 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             os.remove(file_path)
             return
         
-        # Calculate batches
-        batch_size = 10  # Translate 10 subtitles at once
+        # Calculate batches - HUGE batches to maximize 250K token/min limit
+        batch_size = 100  # Translate 100 subtitles at once! (uses ~10K tokens per batch)
         num_batches = (len(subtitles) + batch_size - 1) // batch_size
         
         await update.message.reply_text(
             f"📝 Found {len(subtitles)} subtitles.\n"
-            f"🔄 Starting translation in batches of {batch_size}...\n\n"
-            f"⏱️ Estimated time: ~{num_batches} minutes"
+            f"🚀 Using large batches (100 subs/request)\n"
+            f"📊 Total batches: {num_batches}\n"
+            f"⏱️ Estimated time: ~2-3 minutes"
         )
         
-        # Translate subtitles in batches with rate limiting
+        # Translate subtitles in large batches
         translated_subtitles = []
         requests_count = 0
         
@@ -290,17 +377,16 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             batch_end = min(batch_start + batch_size, len(subtitles))
             batch = subtitles[batch_start:batch_end]
             
-            # Rate limiting: Sleep after every 12 requests (safe under 15/min limit)
+            # Rate limiting: Pause after 12 requests to stay under 15 RPM
             if requests_count >= 12:
                 logger.info("Rate limit protection: Waiting 60 seconds...")
-                await update.message.reply_text("⏸️ Pausing for 60 seconds to respect API limits...")
+                await update.message.reply_text("⏸️ Pausing 60s for rate limits...")
                 await asyncio.sleep(60)
                 requests_count = 0
             
             # Show progress
             progress = int((batch_end / len(subtitles)) * 100)
-            if progress % 25 == 0 or batch_end == len(subtitles):
-                await update.message.reply_text(f"⏳ Progress: {progress}% ({batch_end}/{len(subtitles)})")
+            await update.message.reply_text(f"⏳ {progress}% - Translating {batch_start+1}-{batch_end}/{len(subtitles)}")
             
             # Translate this batch
             translations = await translate_batch_with_gemini(batch, api_key)
