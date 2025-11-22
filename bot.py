@@ -5,6 +5,8 @@ import sqlite3
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 import google.generativeai as genai
+from threading import Thread
+from flask import Flask
 
 # Enable logging
 logging.basicConfig(
@@ -223,6 +225,21 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if os.path.exists(f"translated_{user_id}.srt"):
             os.remove(f"translated_{user_id}.srt")
 
+# Flask app for Render health checks
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return "Bot is running!", 200
+
+@app.route('/health')
+def health():
+    return "OK", 200
+
+def run_flask():
+    port = int(os.environ.get('PORT', 10000))
+    app.run(host='0.0.0.0', port=port)
+
 def main():
     # Initialize database
     init_db()
@@ -233,6 +250,12 @@ def main():
     if not TOKEN:
         logger.error("No TELEGRAM_BOT_TOKEN found!")
         return
+    
+    # Start Flask in a separate thread
+    flask_thread = Thread(target=run_flask)
+    flask_thread.daemon = True
+    flask_thread.start()
+    logger.info("Flask server started!")
     
     # Create application
     application = Application.builder().token(TOKEN).build()
