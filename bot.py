@@ -75,11 +75,9 @@ async def translate_with_gemini(text, api_key, max_retries=3):
                 # Check if it's a rate limit error
                 if "429" in error_str or "quota" in error_str.lower():
                     if attempt < max_retries - 1:
-                        # Extract retry delay from error message or use default
-                        wait_time = 35  # Default wait time
+                        wait_time = 35
                         if "retry in" in error_str.lower():
                             try:
-                                # Try to extract the wait time from error message
                                 import re
                                 match = re.search(r'retry in (\d+)', error_str)
                                 if match:
@@ -87,7 +85,7 @@ async def translate_with_gemini(text, api_key, max_retries=3):
                             except:
                                 pass
                         
-                        logger.warning(f"Rate limit hit. Waiting {wait_time} seconds... (Attempt {attempt + 1}/{max_retries})")
+                        logger.warning(f"Rate limit hit. Waiting {wait_time} seconds...")
                         await asyncio.sleep(wait_time)
                         continue
                     else:
@@ -101,6 +99,70 @@ async def translate_with_gemini(text, api_key, max_retries=3):
     except Exception as e:
         logger.error(f"Translation error: {e}")
         return None
+
+# Batch translate multiple subtitles at once
+async def translate_batch_with_gemini(subtitle_batch, api_key, max_retries=3):
+    try:
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel('gemini-2.5-flash-lite')
+        
+        # Create batch prompt with numbered subtitles
+        batch_text = ""
+        for i, (index, timestamp, text) in enumerate(subtitle_batch, 1):
+            batch_text += f"[{i}] {text.strip()}\n"
+        
+        prompt = f"""Translate these English subtitles to Sinhala. Keep translations natural and conversational.
+        
+Return ONLY the translations in the same format, one per line:
+[1] (Sinhala translation)
+[2] (Sinhala translation)
+etc.
+
+Subtitles to translate:
+{batch_text}"""
+        
+        for attempt in range(max_retries):
+            try:
+                response = model.generate_content(prompt)
+                result = response.text.strip()
+                
+                # Parse the response
+                translations = []
+                lines = result.split('\n')
+                for line in lines:
+                    line = line.strip()
+                    if line.startswith('[') and ']' in line:
+                        # Extract translation after the number
+                        translation = line.split(']', 1)[1].strip()
+                        translations.append(translation)
+                
+                # If parsing fails, return original text
+                if len(translations) != len(subtitle_batch):
+                    logger.warning(f"Batch translation count mismatch. Expected {len(subtitle_batch)}, got {len(translations)}")
+                    # Fall back to original text
+                    return [text.strip() for _, _, text in subtitle_batch]
+                
+                return translations
+                
+            except Exception as e:
+                error_str = str(e)
+                if "429" in error_str or "quota" in error_str.lower():
+                    if attempt < max_retries - 1:
+                        wait_time = 35
+                        logger.warning(f"Rate limit hit. Waiting {wait_time} seconds...")
+                        await asyncio.sleep(wait_time)
+                        continue
+                    else:
+                        logger.error(f"Batch translation failed after {max_retries} attempts")
+                        return [text.strip() for _, _, text in subtitle_batch]
+                else:
+                    logger.error(f"Batch translation error: {e}")
+                    return [text.strip() for _, _, text in subtitle_batch]
+        
+        return [text.strip() for _, _, text in subtitle_batch]
+    except Exception as e:
+        logger.error(f"Batch translation error: {e}")
+        return [text.strip() for _, _, text in subtitle_batch]
 
 # Command handlers
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -210,20 +272,24 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             os.remove(file_path)
             return
         
+        # Calculate batches
+        batch_size = 10  # Translate 10 subtitles at once
+        num_batches = (len(subtitles) + batch_size - 1) // batch_size
+        
         await update.message.reply_text(
             f"📝 Found {len(subtitles)} subtitles.\n"
-            f"🔄 Starting translation...\n\n"
-            f"⚠️ Note: Free tier allows 15 requests/minute.\n"
-            f"This will take approximately {len(subtitles) // 12 + 1} minutes."
+            f"🔄 Starting translation in batches of {batch_size}...\n\n"
+            f"⏱️ Estimated time: ~{num_batches} minutes"
         )
         
-        # Translate subtitles with rate limiting
+        # Translate subtitles in batches with rate limiting
         translated_subtitles = []
-        total = len(subtitles)
-        last_percent = 0
         requests_count = 0
         
-        for i, (index, timestamp, text) in enumerate(subtitles):
+        for batch_start in range(0, len(subtitles), batch_size):
+            batch_end = min(batch_start + batch_size, len(subtitles))
+            batch = subtitles[batch_start:batch_end]
+            
             # Rate limiting: Sleep after every 12 requests (safe under 15/min limit)
             if requests_count >= 12:
                 logger.info("Rate limit protection: Waiting 60 seconds...")
@@ -231,22 +297,23 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await asyncio.sleep(60)
                 requests_count = 0
             
-            # Show progress every 25%
-            current_percent = int((i + 1) / total * 100)
-            if current_percent >= last_percent + 25 and current_percent < 100:
-                await update.message.reply_text(f"⏳ Progress: {current_percent}% ({i + 1}/{total})")
-                last_percent = current_percent
+            # Show progress
+            progress = int((batch_end / len(subtitles)) * 100)
+            if progress % 25 == 0 or batch_end == len(subtitles):
+                await update.message.reply_text(f"⏳ Progress: {progress}% ({batch_end}/{len(subtitles)})")
             
-            translated_text = await translate_with_gemini(text.strip(), api_key)
-            if translated_text:
-                translated_subtitles.append((index, timestamp, translated_text))
-            else:
-                translated_subtitles.append((index, timestamp, text))  # Keep original if translation fails
+            # Translate this batch
+            translations = await translate_batch_with_gemini(batch, api_key)
+            
+            # Add translated subtitles
+            for i, translation in enumerate(translations):
+                index, timestamp, _ = batch[i]
+                translated_subtitles.append((index, timestamp, translation))
             
             requests_count += 1
             
-            # Small delay between requests
-            await asyncio.sleep(0.5)
+            # Small delay between batches
+            await asyncio.sleep(1)
         
         # Create translated SRT file
         translated_content = create_srt(translated_subtitles)
