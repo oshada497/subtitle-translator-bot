@@ -187,9 +187,15 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         # Translate subtitles
         translated_subtitles = []
+        total = len(subtitles)
+        last_percent = 0
+        
         for i, (index, timestamp, text) in enumerate(subtitles):
-            if (i + 1) % 10 == 0:
-                await update.message.reply_text(f"⏳ Translated {i + 1}/{len(subtitles)}...")
+            # Show progress every 25% instead of every 10 subtitles
+            current_percent = int((i + 1) / total * 100)
+            if current_percent >= last_percent + 25 and current_percent < 100:
+                await update.message.reply_text(f"⏳ Progress: {current_percent}% ({i + 1}/{total})")
+                last_percent = current_percent
             
             translated_text = await translate_with_gemini(text.strip(), api_key)
             if translated_text:
