@@ -57,8 +57,8 @@ def create_srt(subtitles):
 async def translate_with_gemini(text, api_key):
     try:
         genai.configure(api_key=api_key)
-        # Use the current Gemini model - gemini-2.0-flash-exp is fast and free
-        model = genai.GenerativeModel('gemini-2.0-flash-exp')
+        # Use gemini-2.5-flash-lite - lightweight and efficient
+        model = genai.GenerativeModel('gemini-2.5-flash-lite')
         
         prompt = f"""Translate the following English subtitle text to Sinhala. 
         Keep the translation natural and conversational. 
