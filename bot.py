@@ -361,12 +361,13 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Calculate batches - HUGE batches to maximize 250K token/min limit
         batch_size = 100  # Translate 100 subtitles at once! (uses ~10K tokens per batch)
         num_batches = (len(subtitles) + batch_size - 1) // batch_size
+        estimated_minutes = (num_batches // 12 + 1) * 1 + (num_batches % 12) * 0.1
         
         await update.message.reply_text(
             f"📝 Found {len(subtitles)} subtitles.\n"
-            f"🚀 Using large batches (100 subs/request)\n"
+            f"🚀 Translating in batches of {batch_size}\n"
             f"📊 Total batches: {num_batches}\n"
-            f"⏱️ Estimated time: ~2-3 minutes"
+            f"⏱️ Estimated time: ~{int(estimated_minutes)} minutes"
         )
         
         # Translate subtitles in large batches
